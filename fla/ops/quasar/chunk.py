@@ -15,6 +15,26 @@ from fla.utils import input_guard
 from fla.utils import IS_AMD
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+# Optional CUDA extension (see guide_cu.md): use when built and on CUDA; else Triton.
+_quasar_cuda_ext = None
+
+def _get_quasar_cuda_ext():
+    global _quasar_cuda_ext
+    if _quasar_cuda_ext is not None:
+        return _quasar_cuda_ext
+    if not torch.cuda.is_available():
+        _quasar_cuda_ext = False
+        return False
+    try:
+        import quasar_forward_substitution_cuda as ext
+        _quasar_cuda_ext = ext
+        return ext
+    except Exception:
+        _quasar_cuda_ext = False
+        return False
+
+
 BT_LIST_AUTOTUNE = [32, 64, 128]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
 
@@ -81,16 +101,25 @@ def chunk_quasar_fwd(
     # Reshape for kernel: [B*H*NT, BT, BT]
     L_flat = L.view(B * H * NT, BT, BT)
     A_flat = torch.empty_like(L_flat)
-    
-    # Compute inverse for all chunks in parallel (ONE kernel launch!)
-    forward_substitution_kernel[(B * H * NT,)](
-        L_ptr=L_flat,
-        L_stride_bh=BT * BT,
-        A_ptr=A_flat,
-        A_stride_bh=BT * BT,
-        BT=BT
+
+    # Use CUDA extension when available (guide_cu.md); else Triton. CUDA ext supports float32/float16 only.
+    ext = _get_quasar_cuda_ext()
+    use_cuda_ext = (
+        ext is not False
+        and L_flat.is_cuda
+        and L_flat.dtype in (torch.float32, torch.float16)
     )
-    
+    if use_cuda_ext:
+        A_flat = ext.forward_substitution(L_flat)
+    else:
+        forward_substitution_kernel[(B * H * NT,)](
+            L_ptr=L_flat,
+            L_stride_bh=BT * BT,
+            A_ptr=A_flat,
+            A_stride_bh=BT * BT,
+            BT=BT,
+        )
+
     A = A_flat.view(B, H, NT, BT, BT)  # [B, H, NT, BT, BT]
     
     # Compute W = A @ (alpha * K) and U = A @ (alpha * V) for all chunks

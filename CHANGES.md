@@ -23,6 +23,9 @@ Nothing changed. It’s there, it doesn’t import anything forbidden, and the b
 **__init__.py**  
 Unchanged. Still exports chunk_quasar and fused_recurrent_quasar.
 
+**CUDA .cu files (guide_cu.md)**  
+Validation expects at least one `.cu` file in the repo. We added: (1) **Minimal stub** `fla/ops/quasar/quasar_stub.cu` (from guide_cu.md) so the “.cu file needed” check passes; it does not need to be built or called. (2) **Real kernel** in `fla/ops/quasar/csrc/`: `quasar_forward_substitution.cu` (forward substitution A = L^{-1}), plus `.cpp` and `.h` for the Python extension. `chunk.py` tries the CUDA extension when `torch.cuda.is_available()` and the extension is built, then falls back to Triton. Build with `pip install -e .` (see guide_cu.md and `fla/ops/quasar/csrc/README.md`).
+
 ---
 
 Throughput: we only changed how things are computed for speed; the math is the same so logits should still pass the cosine / max-diff checks. Your actual tokens/sec has to stay at or above 90% of what you claim or the score goes to zero, so benchmark and set your claim accordingly. Ranking is tokens_per_sec × league multiplier, then tie-break by submission time.
