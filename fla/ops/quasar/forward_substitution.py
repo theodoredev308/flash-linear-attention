@@ -13,7 +13,7 @@ NUM_WARPS = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
 @triton.autotune(
     configs=[
         triton.Config({}, num_warps=num_warps, num_stages=num_stages)
-        for num_warps in [2, 4, 8]
+        for num_warps in [4, 8, 16]
         for num_stages in [2, 3, 4]
     ],
     key=['BT'],
@@ -21,46 +21,33 @@ NUM_WARPS = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
 )
 @triton.jit
 def forward_substitution_kernel(
-    # Input: Lower triangular matrix L (I + M)
-    L_ptr,  # pointer to lower triangular matrix
-    L_stride_bh,  # stride for batch and head
-    # Output: Inverse matrix A
-    A_ptr,  # pointer to inverse matrix
-    A_stride_bh,  # stride for batch and head
+    L_ptr,
+    L_stride_bh,
+    A_ptr,
+    A_stride_bh,
     BT: tl.constexpr,
 ):
     """
-    Compute inverse of lower triangular matrix using forward substitution.
-    
-    For L = I + M (lower triangular with 1s on diagonal):
-    Compute A = L^(-1) using forward substitution:
-    - A[i,i] = 1
-    - A[i,j] = -sum(L[i,k] * A[k,j] for k in range(j,i)) for j < i
+    Inverse of lower triangular L via forward substitution.
+    A[i,i]=1, A[i,j] = -sum(L[i,k]*A[k,j]) for k in [j,i), j < i.
+    Inner k-sum vectorized for better GPU utilization.
     """
-    # Get batch-head index
     i_bh = tl.program_id(0)
-    
-    # Compute pointer offsets for this batch-head
     L_offset = i_bh * L_stride_bh
     A_offset = i_bh * A_stride_bh
-    
-    # Initialize A as identity matrix
+    # Initialize A to identity (vectorized per row)
     for i in range(BT):
-        for j in range(BT):
-            if i == j:
-                tl.store(A_ptr + A_offset + i * BT + j, 1.0)
-            else:
-                tl.store(A_ptr + A_offset + i * BT + j, 0.0)
-    
-    # Forward substitution
+        idx = tl.arange(0, BT)
+        val = tl.where(idx == i, 1.0, 0.0)
+        tl.store(A_ptr + A_offset + i * BT + idx, val)
+    # Forward substitution: vectorize inner k-loop
     for i in range(1, BT):
         for j in range(i):
-            # A[i,j] = -sum(L[i,k] * A[k,j] for k in range(j,i))
-            sum_val = 0.0
-            for k in range(j, i):
-                L_ik = tl.load(L_ptr + L_offset + i * BT + k)
-                A_kj = tl.load(A_ptr + A_offset + k * BT + j)
-                sum_val += L_ik * A_kj
+            nk = i - j
+            off_k = tl.arange(0, nk)
+            L_ik = tl.load(L_ptr + L_offset + i * BT + j + off_k)
+            A_kj = tl.load(A_ptr + A_offset + (j + off_k) * BT + j)
+            sum_val = tl.sum(L_ik * A_kj)
             tl.store(A_ptr + A_offset + i * BT + j, -sum_val)
 
 

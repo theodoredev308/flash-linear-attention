@@ -9,7 +9,7 @@ import triton.language as tl
 from fla.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, check_shared_mem, input_guard
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
-BT_LIST_AUTOTUNE = [32, 64, 128]
+BT_LIST_AUTOTUNE = [32, 64, 128, 256]
 NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
 
 
@@ -44,7 +44,7 @@ def naive_quasar_gate(
         triton.Config({"BT": BT}, num_warps=num_warps, num_stages=num_stages)
         for BT in BT_LIST_AUTOTUNE
         for num_warps in NUM_WARPS_AUTOTUNE
-        for num_stages in [2, 3]
+        for num_stages in [2, 3, 4]
     ],
     key=["H", "D"],
     **autotune_cache_kwargs,

@@ -2,13 +2,17 @@
 # Modified for QuasarAttention
 
 import torch
-import torch.nn.functional as F
 import triton
 import triton.language as tl
 
 from fla.ops.utils.index import prepare_chunk_indices
 from fla.ops.quasar.forward_substitution import forward_substitution_kernel
-from fla.utils import IS_AMD, autocast_custom_bwd, autocast_custom_fwd, autotune_cache_kwargs, check_shared_mem, input_guard
+from fla.utils import autocast_custom_bwd
+from fla.utils import autocast_custom_fwd
+from fla.utils import autotune_cache_kwargs
+from fla.utils import check_shared_mem
+from fla.utils import input_guard
+from fla.utils import IS_AMD
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
 BT_LIST_AUTOTUNE = [32, 64, 128]
@@ -67,15 +71,12 @@ def chunk_quasar_fwd(
     # [B, H, NT, BT, S] @ [B, H, NT, S, BT] -> [B, H, NT, BT, BT]
     KK_t = torch.matmul(k_chunks, k_chunks.transpose(-2, -1))  # [B, H, NT, BT, BT]
     
-    # M = tril(alpha * KK^T) for all chunks
-    # alpha is [B, H, NT, BT, 1], KK_t is [B, H, NT, BT, BT]
+    # M = tril(alpha * KK^T) for all chunks (in-place tril to save memory)
     alpha_expanded = alpha.expand(-1, -1, -1, -1, BT)  # [B, H, NT, BT, BT]
-    M = (alpha_expanded * KK_t).tril(diagonal=-1)  # [B, H, NT, BT, BT]
-    
-    # Compute L = I + M for all chunks
-    # I = [1, 1, NT, BT, BT]
-    I = torch.eye(BT, device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0).unsqueeze(0).expand(B, H, NT, -1, -1)  # [B, H, NT, BT, BT]
-    L = I + M  # [B, H, NT, BT, BT] lower triangular with 1s on diagonal
+    M = (alpha_expanded * KK_t).tril(diagonal=-1)
+    # L = I + M: avoid large eye expand; set diagonal to 1
+    L = M.clone(memory_format=torch.contiguous_format)
+    L.diagonal(dim1=-2, dim2=-1).fill_(1.0)
     
     # Reshape for kernel: [B*H*NT, BT, BT]
     L_flat = L.view(B * H * NT, BT, BT)
@@ -97,42 +98,31 @@ def chunk_quasar_fwd(
     W = torch.matmul(A, alpha_expanded * k_chunks)  # [B, H, NT, BT, S]
     U = torch.matmul(A, alpha_expanded * v_chunks)  # [B, H, NT, BT, S]
     
-    # Initialize output tensor
+    # Precompute key transposes once [B, H, NT, S, BT] for fast loop
+    k_c_t_all = k_chunks.transpose(-2, -1).contiguous()
+    # Identity once for all chunk steps (reuse across loop)
+    I_full = torch.eye(S, device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
     o = torch.empty_like(q)
-    
-    # Initialize state
     if initial_state is None:
         state = torch.zeros(B, H, S, S, dtype=q.dtype, device=q.device)
     else:
         state = initial_state.clone()
-    
-    # Process chunks sequentially for state updates (this is inherently sequential)
-    # But intra-chunk computations are already vectorized!
+    # Batched state shape for bmm: [B*H, S, S]
+    state_flat = state.view(B * H, S, S)
     for i in range(NT):
         q_c = q_chunks[:, :, i]  # [B, H, BT, S]
-        k_c = k_chunks[:, :, i]  # [B, H, BT, S]
-        W_c = W[:, :, i]  # [B, H, BT, S]
-        U_c = U[:, :, i]  # [B, H, BT, S]
-        
-        # Inter-chunk state transition
-        # A = I - K^T @ W
-        # B = K^T @ U
-        I_full = torch.eye(S, device=q.device, dtype=q.dtype).unsqueeze(0).unsqueeze(0)  # [1, 1, S, S]
-        A_trans = I_full - torch.matmul(k_c.transpose(-2, -1), W_c)  # [B, H, S, S]
-        B_trans = torch.matmul(k_c.transpose(-2, -1), U_c)  # [B, H, S, S]
-        
-        # Update state: S_new = A @ S_prev + B
-        state = torch.matmul(A_trans, state) + B_trans  # [B, H, S, S]
-        
-        # Compute output
-        # o = q @ S_prev + q @ K^T @ (U - W @ S_prev)
-        o_inter = torch.matmul(q_c, state)  # [B, H, BT, S]
-        o_intra = torch.matmul(q_c, torch.matmul(k_c.transpose(-2, -1), U_c - torch.matmul(W_c, state)))  # [B, H, BT, S]
-        o_c = o_inter + o_intra  # [B, H, BT, S]
-        
-        # Store output
-        o_c = o_c.transpose(1, 2)  # [B, BT, H, S]
-        o[:, i*BT:(i+1)*BT] = o_c
+        k_c_t = k_c_t_all[:, :, i]  # [B, H, S, BT]
+        W_c = W[:, :, i]
+        U_c = U[:, :, i]
+        A_trans = I_full - torch.matmul(k_c_t, W_c)
+        B_trans = torch.matmul(k_c_t, U_c)
+        # state = A @ state + B (batched matmul for throughput)
+        state_flat = torch.bmm(A_trans.view(B * H, S, S), state_flat) + B_trans.view(B * H, S, S)
+        state = state_flat.view(B, H, S, S)
+        W_state = torch.matmul(W_c, state)
+        o_inter = torch.matmul(q_c, state)
+        o_intra = torch.matmul(q_c, torch.matmul(k_c_t, U_c - W_state))
+        o[:, i * BT : (i + 1) * BT] = (o_inter + o_intra).transpose(1, 2)
     
     final_state = state if output_final_state else None
     

@@ -21,7 +21,7 @@ NUM_WARPS_AUTOTUNE = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]
         triton.Config({'BT': BT}, num_warps=num_warps, num_stages=num_stages)
         for BT in BT_LIST_AUTOTUNE
         for num_warps in NUM_WARPS_AUTOTUNE
-        for num_stages in [2, 3]
+        for num_stages in [2, 3, 4]
     ],
     key=['B', 'H', 'S'],
     **autotune_cache_kwargs,
