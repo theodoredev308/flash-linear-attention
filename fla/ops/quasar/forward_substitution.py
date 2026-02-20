@@ -1,10 +1,10 @@
 # Copyright (c) 2023-2025, Songlin Yang, Yu Zhang
 # Modified for QuasarAttention
+from __future__ import annotations
 
 import torch
 import triton
 import triton.language as tl
-
 from fla.utils import IS_AMD, autotune_cache_kwargs, check_shared_mem, input_guard
 
 NUM_WARPS = [2, 4, 8, 16] if IS_AMD else [4, 8, 16, 32]

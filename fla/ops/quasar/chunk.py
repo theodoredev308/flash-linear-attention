@@ -6,7 +6,6 @@ import triton
 import triton.language as tl
 
 from fla.ops.utils.index import prepare_chunk_indices
-from fla.ops.quasar.forward_substitution import forward_substitution_kernel
 from fla.utils import autocast_custom_bwd
 from fla.utils import autocast_custom_fwd
 from fla.utils import autotune_cache_kwargs
@@ -15,6 +14,21 @@ from fla.utils import input_guard
 from fla.utils import IS_AMD
 
 BS_LIST = [32, 64] if check_shared_mem() else [16, 32]
+
+# Lazy: avoid importing forward_substitution at load time (miner env may have broken triton there).
+_forward_substitution_kernel = None
+
+def _get_forward_substitution_kernel():
+    global _forward_substitution_kernel
+    if _forward_substitution_kernel is not None:
+        return _forward_substitution_kernel
+    try:
+        from fla.ops.quasar.forward_substitution import forward_substitution_kernel
+        _forward_substitution_kernel = forward_substitution_kernel
+        return forward_substitution_kernel
+    except Exception:
+        _forward_substitution_kernel = False
+        return False
 
 # Optional CUDA extension (see guide_cu.md): use when built and on CUDA; else Triton.
 _quasar_cuda_ext = None
@@ -112,13 +126,20 @@ def chunk_quasar_fwd(
     if use_cuda_ext:
         A_flat = ext.forward_substitution(L_flat)
     else:
-        forward_substitution_kernel[(B * H * NT,)](
-            L_ptr=L_flat,
-            L_stride_bh=BT * BT,
-            A_ptr=A_flat,
-            A_stride_bh=BT * BT,
-            BT=BT,
-        )
+        kernel = _get_forward_substitution_kernel()
+        if kernel is not False:
+            kernel[(B * H * NT,)](
+                L_ptr=L_flat,
+                L_stride_bh=BT * BT,
+                A_ptr=A_flat,
+                A_stride_bh=BT * BT,
+                BT=BT,
+            )
+        else:
+            # PyTorch fallback when Triton kernel unavailable (e.g. miner env with broken forward_substitution)
+            n_batch = L_flat.size(0)
+            I = torch.eye(BT, device=L_flat.device, dtype=L_flat.dtype).unsqueeze(0).expand(n_batch, -1, -1)
+            A_flat = torch.linalg.solve_triangular(L_flat, I, upper=False, unitriangular=True)
 
     A = A_flat.view(B, H, NT, BT, BT)  # [B, H, NT, BT, BT]
     
