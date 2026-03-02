@@ -41,12 +41,14 @@ def forward_substitution_kernel(
         val = tl.where(idx == i, 1.0, 0.0)
         tl.store(A_ptr + A_offset + i * BT + idx, val)
     # Forward substitution: vectorize inner k-loop
+    # tl.arange bounds must be constexpr; use BT and mask for dynamic length nk
+    idx = tl.arange(0, BT)
     for i in range(1, BT):
         for j in range(i):
             nk = i - j
-            off_k = tl.arange(0, nk)
-            L_ik = tl.load(L_ptr + L_offset + i * BT + j + off_k)
-            A_kj = tl.load(A_ptr + A_offset + (j + off_k) * BT + j)
+            mask = idx < nk
+            L_ik = tl.load(L_ptr + L_offset + i * BT + j + idx, mask=mask, other=0.0)
+            A_kj = tl.load(A_ptr + A_offset + (j + idx) * BT + j, mask=mask, other=0.0)
             sum_val = tl.sum(L_ik * A_kj)
             tl.store(A_ptr + A_offset + i * BT + j, -sum_val)
 
